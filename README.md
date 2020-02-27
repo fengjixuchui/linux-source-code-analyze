@@ -6,6 +6,8 @@
 * 进程管理
     * [进程管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/process-management.md)
     * [进程调度](https://github.com/liexusong/linux-source-code-analyze/blob/master/process-schedule.md)
+    * [并发同步](https://github.com/liexusong/linux-source-code-analyze/blob/master/concurrency-synchronize.md)
+    * [等待队列](https://github.com/liexusong/linux-source-code-analyze/blob/master/waitqueue.md)
 * 内存管理
     * [物理内存管理(上)](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-1.md)
     * [物理内存管理(中)](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-2.md)
@@ -31,3 +33,5 @@
     * [定时器实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/kernel-timer.md)
     * [多路复用I/O](https://github.com/liexusong/linux-source-code-analyze/blob/master/multiplexing-io.md)
     * [docker实现原理之 - namespace](https://github.com/liexusong/linux-source-code-analyze/blob/master/namespace.md)
+* 2.6+内核分析
+    * [Epoll原理与实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/epoll-principle.md)    
