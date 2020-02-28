@@ -55,7 +55,7 @@ struct eventpoll {
 
 由于被监听的文件是通过 `epitem` 对象来管理的，所以上图中的节点都是以 `epitem` 对象的形式存在的。为什么要使用红黑树来管理被监听的文件呢？这是为了能够通过文件句柄快速查找到其对应的 `epitem` 对象。红黑树是一种平衡二叉树，如果对其不了解可以查阅相关的文档。
 
-### 向 epoll 添加监听的文件
+### 向 epoll 添加文件句柄
 
 前面介绍了怎么创建 `epoll`，接下来介绍一下怎么向 `epoll` 添加要监听的文件。
 
@@ -88,3 +88,210 @@ struct epoll_event {
 
 `data` 用来保存用户自定义数据。
 
+`epoll_ctl()` 函数会调用 `sys_epoll_ctl()` 内核函数，`sys_epoll_ctl()` 内核函数的实现如下：
+```cpp
+asmlinkage long sys_epoll_ctl(int epfd, int op, 
+    int fd, struct epoll_event __user *event)
+{
+    ...
+    file = fget(epfd);
+    tfile = fget(fd);
+    ...
+    ep = file->private_data;
+
+    mutex_lock(&ep->mtx);
+
+    epi = ep_find(ep, tfile, fd);
+
+    error = -EINVAL;
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (!epi) {
+            epds.events |= POLLERR | POLLHUP;
+
+            error = ep_insert(ep, &epds, tfile, fd);
+        } else
+            error = -EEXIST;
+        break;
+    ...
+    }
+    mutex_unlock(&ep->mtx);
+
+    ...
+    return error;
+}
+```
+`sys_epoll_ctl()` 函数会根据传入不同 `op` 的值来进行不同操作，比如传入 `EPOLL_CTL_ADD` 表示要进行添加操作，那么就调用 `ep_insert()` 函数来进行添加操作。
+
+我们继续来分析添加操作 `ep_insert()` 函数的实现：
+```cpp
+static int ep_insert(struct eventpoll *ep, struct epoll_event *event,
+             struct file *tfile, int fd)
+{
+    ...
+    error = -ENOMEM;
+    // 申请一个 epitem 对象
+    if (!(epi = kmem_cache_alloc(epi_cache, GFP_KERNEL)))
+        goto error_return;
+
+    // 初始化 epitem 对象
+    INIT_LIST_HEAD(&epi->rdllink);
+    INIT_LIST_HEAD(&epi->fllink);
+    INIT_LIST_HEAD(&epi->pwqlist);
+    epi->ep = ep;
+    ep_set_ffd(&epi->ffd, tfile, fd);
+    epi->event = *event;
+    epi->nwait = 0;
+    epi->next = EP_UNACTIVE_PTR;
+
+    epq.epi = epi;
+    // 等价于: epq.pt->qproc = ep_ptable_queue_proc
+    init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+    // 调用被监听文件的 poll 接口. 
+    // 这个接口又各自文件系统实现, 如socket的话, 那么这个接口就是 tcp_poll().
+    revents = tfile->f_op->poll(tfile, &epq.pt);
+    ...
+    ep_rbtree_insert(ep, epi); // 把 epitem 对象添加到epoll的红黑树中进行管理
+
+    spin_lock_irqsave(&ep->lock, flags);
+
+    // 如果被监听的文件已经可以进行对应的读写操作
+    // 那么就把文件添加到epoll的就绪队列 rdllink 中, 并且唤醒调用 epoll_wait() 的进程.
+    if ((revents & event->events) && !ep_is_linked(&epi->rdllink)) {
+        list_add_tail(&epi->rdllink, &ep->rdllist);
+
+        if (waitqueue_active(&ep->wq))
+            wake_up_locked(&ep->wq);
+        if (waitqueue_active(&ep->poll_wait))
+            pwake++;
+    }
+
+    spin_unlock_irqrestore(&ep->lock, flags);
+    ...
+    return 0;
+    ...
+}
+```
+被监听的文件是通过 `epitem` 对象进行管理的，也就是说被监听的文件会被封装成 `epitem` 对象，然后会被添加到 `eventpoll` 对象的红黑树中进行管理（如上述代码中的 `ep_rbtree_insert(ep, epi)`）。
+
+`tfile->f_op->poll(tfile, &epq.pt)` 这行代码的作用是调用被监听文件的 `poll()` 接口，如果被监听的文件是一个socket句柄，那么就会调用 `tcp_poll()`，我们来看看 `tcp_poll()` 做了什么操作：
+```cpp
+unsigned int tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
+{
+    struct sock *sk = sock->sk;
+    ...
+    poll_wait(file, sk->sk_sleep, wait);
+    ...
+    return mask;
+}
+```
+每个 `socket` 对象都有个等待队列（`waitqueue`, 关于等待队列可以参考文章: [等待队列原理与实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/waitqueue.md)），用于存放等待 socket 状态更改的进程。
+
+从上述代码可以知道，`tcp_poll()` 调用了 `poll_wait()` 函数，而 `poll_wait()` 最终会调用 `ep_ptable_queue_proc()` 函数，`ep_ptable_queue_proc()` 函数实现如下：
+```cpp
+static void ep_ptable_queue_proc(struct file *file, 
+    wait_queue_head_t *whead, poll_table *pt)
+{
+    struct epitem *epi = ep_item_from_epqueue(pt);
+    struct eppoll_entry *pwq;
+
+    if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
+        init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
+        pwq->whead = whead;
+        pwq->base = epi;
+        add_wait_queue(whead, &pwq->wait);
+        list_add_tail(&pwq->llink, &epi->pwqlist);
+        epi->nwait++;
+    } else {
+        epi->nwait = -1;
+    }
+}
+```
+`ep_ptable_queue_proc()` 函数主要工作是把当前 `epitem` 对象添加到 socket 对象的等待队列中，并且设置唤醒函数为 `ep_poll_callback()`，也就是说，当socket状态发生变化时，会触发调用 `ep_poll_callback()` 函数。`ep_poll_callback()` 函数实现如下：
+```cpp
+static int ep_poll_callback(wait_queue_t *wait, unsigned mode, int sync, void *key)
+{
+    ...
+    // 把就绪的文件添加到就绪队列中
+    list_add_tail(&epi->rdllink, &ep->rdllist);
+
+is_linked:
+    // 唤醒调用 epoll_wait() 而被阻塞的进程
+    if (waitqueue_active(&ep->wq))
+        wake_up_locked(&ep->wq);
+    ...
+    return 1;
+}
+```
+`ep_poll_callback()` 函数的主要工作是把就绪的文件添加到 `eventepoll` 对象的就绪队列中，然后唤醒调用 `epoll_wait()` 被阻塞的进程。
+
+### 等待被监听的文件状态发生改变
+
+把被监听的文件句柄添加到epoll后，就可以通过调用 `epoll_wait()` 等待被监听的文件状态发生改变。`epoll_wait()` 调用会阻塞当前进程，当被监听的文件状态发生改变时，`epoll_wait()` 调用便会返回。
+
+`epoll_wait()` 系统调用的原型如下：
+```cpp
+long epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+```
+各个参数的意义：
+1. `epfd`: 调用 `epoll_create()` 函数创建的epoll句柄。
+2. `events`: 用来存放就绪文件列表。
+3. `maxevents`: `events` 数组的大小。
+4. `timeout`: 设置等待的超时时间。
+
+`epoll_wait()` 函数会调用 `sys_epoll_wait()` 内核函数，而 `sys_epoll_wait()` 函数最终会调用 `ep_poll()` 函数，我们来看看 `ep_poll()` 函数的实现：
+```cpp
+static int ep_poll(struct eventpoll *ep, 
+    struct epoll_event __user *events, int maxevents, long timeout)
+{
+    ...
+    // 如果就绪文件列表为空
+    if (list_empty(&ep->rdllist)) {
+        // 把当前进程添加到epoll的等待队列中
+        init_waitqueue_entry(&wait, current);
+        wait.flags |= WQ_FLAG_EXCLUSIVE;
+        __add_wait_queue(&ep->wq, &wait);
+
+        for (;;) {
+            set_current_state(TASK_INTERRUPTIBLE); // 把当前进程设置为睡眠状态
+            if (!list_empty(&ep->rdllist) || !jtimeout) // 如果有就绪文件或者超时, 退出循环
+                break;
+            if (signal_pending(current)) { // 接收到信号也要退出
+                res = -EINTR;
+                break;
+            }
+
+            spin_unlock_irqrestore(&ep->lock, flags);
+            jtimeout = schedule_timeout(jtimeout); // 让出CPU, 切换到其他进程进行执行
+            spin_lock_irqsave(&ep->lock, flags);
+        }
+        // 有3种情况会执行到这里:
+        // 1. 被监听的文件集合中有就绪的文件
+        // 2. 设置了超时时间并且超时了
+        // 3. 接收到信号
+        __remove_wait_queue(&ep->wq, &wait);
+
+        set_current_state(TASK_RUNNING);
+    }
+    /* 是否有就绪的文件? */
+    eavail = !list_empty(&ep->rdllist);
+
+    spin_unlock_irqrestore(&ep->lock, flags);
+
+    if (!res && eavail 
+        && !(res = ep_send_events(ep, events, maxevents)) && jtimeout)
+        goto retry;
+
+    return res;
+}
+```
+`ep_poll()` 函数主要做以下几件事：
+1. 判断被监听的文件集合中是否有就绪的文件，如果有就返回。
+2. 如果没有就把当前进程添加到epoll的等待队列中，并且进入睡眠。
+3. 进程会一直睡眠直到有以下几种情况发生：
+   1. 被监听的文件集合中有就绪的文件
+   2. 设置了超时时间并且超时了
+   3. 接收到信号
+4. 如果有就绪的文件，那么就调用 `ep_send_events()` 函数把就绪文件复制到 `events` 参数中。
+5. 返回就绪文件的个数。
