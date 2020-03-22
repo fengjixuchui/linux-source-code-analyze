@@ -4,7 +4,9 @@
 
 ### CGroup 使用
 
-本文主要以 `内存子系统（memory subsys）` 作为例子来阐述 `CGroup` 的原理，所以这里先介绍怎么通过 `内存子系统` 来限制进程对内存的使用。
+本文主要以 `内存子系统（memory subsystem）` 作为例子来阐述 `CGroup` 的原理，所以这里先介绍怎么通过 `内存子系统` 来限制进程对内存的使用。
+
+> `子系统` 是 `CGroup` 用于控制某种资源（如内存或者CPU等）使用的逻辑或者算法
 
 `CGroup` 使用了 `虚拟文件系统` 来进行管理限制的资源信息和被限制的进程列表等，例如要创建一个限制内存使用的 `CGroup` 可以使用下面命令：
 ```bash
@@ -25,7 +27,7 @@ memory.force_empty          memory.kmem.tcp.max_usage_in_bytes  memory.memsw.max
 memory.kmem.failcnt         memory.kmem.tcp.usage_in_bytes      memory.memsw.usage_in_bytes      memory.swappiness
 memory.kmem.limit_in_bytes  memory.kmem.usage_in_bytes          memory.move_charge_at_immigrate  memory.usage_in_bytes
 ```
-我们可以向 `memory.limit_in_bytes` 文件写入限制进程（进程组）使用的内存大小，单位为字节(bytes)。例如可以使用以下命令写入限制使用的内存大小为 `1MB`：
+可以看到在目录下有很多文件，每个文件都是 `CGroup` 用于控制进程组的资源使用。我们可以向 `memory.limit_in_bytes` 文件写入限制进程（进程组）使用的内存大小，单位为字节(bytes)。例如可以使用以下命令写入限制使用的内存大小为 `1MB`：
 ```bash
 $ echo 1048576 > /sys/fs/cgroup/memory/test/memory.limit_in_bytes
 ```
@@ -49,9 +51,15 @@ $ echo task_pid > /sys/fs/cgroup/memory/test/tasks
 
 他们之间的关系如下图：
 
-![cgroup-base](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/cgroup-base.png)
+![cgroup-base](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/cgroup-base.jpg)
+
+我们可以把 `层级` 中的一个目录当成是一个 `CGroup`，那么目录里面的文件就是这个 `CGroup` 用于控制进程组使用各种资源的信息（比如 `tasks` 文件用于保存这个 `CGroup` 控制的进程组所有的进程PID，而 `memory.limit_in_bytes` 文件用于描述这个 `CGroup` 能够使用的内存字节数）。
+
+而附加在 `层级` 上的 `子系统` 表示这个 `层级` 中的 `CGroup` 可以控制哪些资源，每当向 `层级` 附加 `子系统` 时，`层级` 中的所有 `CGroup` 都会产生很多与 `子系统` 资源控制相关的文件。
 
 ### CGroup 操作规则
+
+使用 `CGroup` 时，必须按照 `CGroup` 一些操作规则来进行操作，否则会出错。下面介绍一下关于 `CGroup` 的一些操作规则：
 
 1. 一个 `层级` 可以附加多个 `子系统`，如下图：
 
@@ -69,3 +77,4 @@ $ echo task_pid > /sys/fs/cgroup/memory/test/tasks
 
 ![cgroup-rule4](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/cgroup-rule4.jpeg)
 
+关于 `CGroup` 的介绍和使用就到这里，接下来我们来分析一下内核是怎么实现 `CGroup` 的。
