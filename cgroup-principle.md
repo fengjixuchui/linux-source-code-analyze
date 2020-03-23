@@ -70,7 +70,7 @@ struct mem_cgroup {
 
 从上图可以看出，`mem_cgroup` 结构包含了 `cgroup_subsys_state` 结构，`内存子系统` 对外暴露出 `mem_cgroup` 结构的 `cgroup_subsys_state` 部分（即返回 `cgroup_subsys_state` 结构的指针），而其余部分由 `内存子系统` 自己维护和使用。
 
-由于 `cgroup_subsys_state` 部分在 `mem_cgroup` 结构的首部，所以要将 `cgroup_subsys_state` 结构转换成 `mem_cgroup` 结构，只需要通过指针类型转换即可。如下代码：
+由于 `cgroup_subsys_state` 部分在 `mem_cgroup` 结构的首部，所以要将 `cgroup_subsys_state` 结构转换成 `mem_cgroup` 结构，只需要通过指针类型转换即可。
 
 `cgroup` 结构与 `cgroup_subsys_state` 结构之间的关系如下图：
 
@@ -145,7 +145,7 @@ struct cgroup_subsys {
 };
 ```
 
-`cgroup_subsys` 结构包含了很多函数指针，通过这些函数指针，`CGroup` 可以对 `子系统` 进行一些操作。比如向 `CGroup` 的 `tasks` 文件添加要控制的进程PID时，就会调用 `cgroup_subsys` 结构的 `attach()` 函数。当在 `层级` 中创建新目录时，就会调用 `create()` 函数创建一些与 `子系统` 相关的文件。
+`cgroup_subsys` 结构包含了很多函数指针，通过这些函数指针，`CGroup` 可以对 `子系统` 进行一些操作。比如向 `CGroup` 的 `tasks` 文件添加要控制的进程PID时，就会调用 `cgroup_subsys` 结构的 `attach()` 函数。当在 `层级` 中创建新目录时，就会调用 `create()` 函数创建一个 `子系统` 的资源控制统计信息对象 `cgroup_subsys_state`，并且调用 `populate()` 函数创建 `子系统` 相关的资源控制信息文件。
 
 除了函数指针外，`cgroup_subsys` 结构还包含了很多字段，下面说明一下各个字段的作用：
 1. `subsys_id`: 表示了子系统的ID。
@@ -245,11 +245,17 @@ struct cgroupfs_root {
 
 其中最重要的是 `subsys_list` 和 `top_cgroup` 字段，`subsys_list` 表示了附加到此 `层级` 的所有 `子系统`，而 `top_cgroup` 表示此 `层级` 的根 `cgroup`。
 
-接着调用 `rebind_subsystems()` 函数把挂载时指定附加的 `子系统` 添加到 `cgroupfs_root` 结构的 `subsys_list` 链表中，最后调用 `cgroup_populate_dir()` 函数向挂载目录创建 `cgroup` 的管理文件（如 `tasks` 文件）和各个 `子系统` 的管理文件（如 `memory.limit_in_bytes` 文件）。
+接着调用 `rebind_subsystems()` 函数把挂载时指定要附加的 `子系统` 添加到 `cgroupfs_root` 结构的 `subsys_list` 链表中，并且为根 `cgroup` 的 `subsys` 字段设置各个 `子系统` 的资源控制统计信息对象，最后调用 `cgroup_populate_dir()` 函数向挂载目录创建 `cgroup` 的管理文件（如 `tasks` 文件）和各个 `子系统` 的管理文件（如 `memory.limit_in_bytes` 文件）。
 
 ### 向 `CGroup` 添加要进行资源控制的进程
 
-通过向 `CGroup` 的 `tasks` 文件写入要进行资源控制的进程PID，即可以对进程进行资源控制。向 `tasks` 文件写入进程PID是通过 `attach_task_by_pid()` 函数实现的，代码如下：
+通过向 `CGroup` 的 `tasks` 文件写入要进行资源控制的进程PID，即可以对进程进行资源控制。例如下面命令：
+
+```bash
+$ echo 123012 > /sys/fs/cgroup/memory/test/tasks
+```
+
+向 `tasks` 文件写入进程PID是通过 `attach_task_by_pid()` 函数实现的，代码如下：
 
 ```cpp
 static int attach_task_by_pid(struct cgroup *cgrp, char *pidbuf)
@@ -295,10 +301,11 @@ int cgroup_attach_task(struct cgroup *cgrp, struct task_struct *tsk)
     struct cgroupfs_root *root = cgrp->root;
 
     ...
-    newcg = find_css_set(cg, cgrp);
+    newcg = find_css_set(cg, cgrp); // 根据新的cgroup查找css_set对象
     ...
-    rcu_assign_pointer(tsk->cgroups, newcg);
+    rcu_assign_pointer(tsk->cgroups, newcg); // 把进程的cgroups字段设置为新的css_set对象
     ...
+    // 把进程添加到css_set对象的tasks列表中
     write_lock(&css_set_lock);
     if (!list_empty(&tsk->cg_list)) {
         list_del(&tsk->cg_list);
@@ -306,6 +313,7 @@ int cgroup_attach_task(struct cgroup *cgrp, struct task_struct *tsk)
     }
     write_unlock(&css_set_lock);
 
+    // 调用各个子系统的attach函数
     for_each_subsys(root, ss) {
         if (ss->attach)
             ss->attach(ss, cgrp, oldcgrp, tsk);
@@ -315,4 +323,71 @@ int cgroup_attach_task(struct cgroup *cgrp, struct task_struct *tsk)
 }
 ```
 
+`cgroup_attach_task()` 函数首先会调用 `find_css_set()` 函数查找或者创建一个 `css_set` 对象。前面说过 `css_set` 对象用于收集不同 `cgroup` 上附加的 `子系统` 资源统计信息对象。
 
+因为一个进程能够被加入到不同的 `cgroup` 进行资源控制，所以 `find_css_set()` 函数就是收集进程所在的所有 `cgroup` 上附加的 `子系统` 资源统计信息对象，并返回一个 `css_set` 对象。接着把进程描述符的 `cgroups` 字段设置为这个 `css_set` 对象，并且把进程添加到这个 `css_set` 对象的 `tasks` 链表中。
+
+最后，`cgroup_attach_task()` 函数会调用附加在 `层级` 上的所有 `子系统` 的 `attach()` 函数对新增进程进行一些其他的操作（这些操作由各自 `子系统` 去实现）。
+
+
+### 限制 `CGroup` 的资源使用
+
+本文主要是使用 `内存子系统` 作为例子，所以这里分析内存限制的原理。
+
+可以向 `cgroup` 的 `memory.limit_in_bytes` 文件写入要限制使用的内存大小（单位为字节），如下面命令限制了这个 `cgroup` 只能使用 1MB 的内存：
+
+```bash
+$ echo 1048576 > /sys/fs/cgroup/memory/test/memory.limit_in_bytes
+```
+
+向 `memory.limit_in_bytes` 写入数据主要通过 `mem_cgroup_write()` 函数实现的，其实现如下：
+
+```cpp
+static ssize_t mem_cgroup_write(struct cgroup *cont, struct cftype *cft,
+                struct file *file, const char __user *userbuf,
+                size_t nbytes, loff_t *ppos)
+{
+    return res_counter_write(&mem_cgroup_from_cont(cont)->res,
+                cft->private, userbuf, nbytes, ppos,
+                mem_cgroup_write_strategy);
+}
+```
+
+其主要工作就是把 `内存子系统` 的资源控制对象 `mem_cgroup` 的 `res.limit` 字段设置为指定的数值。
+
+### 限制进程使用资源
+
+当设置好 `cgroup` 的资源使用限制信息，并且把进程添加到这个 `cgroup` 的 `tasks` 列表后，进程的资源使用就会受到这个 `cgroup` 的限制。这里使用 `内存子系统`
+作为例子，来分析一下内核是怎么通过 `cgroup` 来限制进程对资源的使用的。
+
+当进程要使用内存时，会调用 `do_anonymous_page()` 来申请一些内存页，而 `do_anonymous_page()` 函数会调用 `mem_cgroup_charge()` 函数来检测进程是否超过了 `cgroup` 设置的资源限制。而 `mem_cgroup_charge()` 最终会调用 `mem_cgroup_charge_common()` 函数进行检测，`mem_cgroup_charge_common()` 函数实现如下：
+
+```cpp
+static int mem_cgroup_charge_common(struct page *page, struct mm_struct *mm,
+                gfp_t gfp_mask, enum charge_type ctype)
+{
+    struct mem_cgroup *mem;
+    ...
+    mem = rcu_dereference(mm->mem_cgroup); // 获取进程对应的内存限制对象
+    ...
+    while (res_counter_charge(&mem->res, PAGE_SIZE)) { // 判断进程使用内存是否超出限制
+        if (!(gfp_mask & __GFP_WAIT))
+            goto out;
+
+        if (try_to_free_mem_cgroup_pages(mem, gfp_mask)) // 如果超出限制, 就释放一些不用的内存
+            continue;
+
+        if (res_counter_check_under_limit(&mem->res))
+            continue;
+
+        if (!nr_retries--) {
+            mem_cgroup_out_of_memory(mem, gfp_mask); // 如果尝试过5次后还是超出限制, 那么发出oom信号
+            goto out;
+        }
+        ...
+    }
+    ...
+}
+```
+
+`mem_cgroup_charge_common()` 函数会对进程内存使用情况进行检测，如果进程已经超过了 `cgroup` 设置的限制，那么就会尝试进行释放一些不用的内存，如果还是超过限制，那么就会发出 `OOM (out of memory)` 的信号。
