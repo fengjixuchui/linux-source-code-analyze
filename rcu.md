@@ -112,3 +112,90 @@ void foo_update(foo* new_fp)
 
 ### RCU 实现
 
+在介绍 `RCU` 实现前，先要介绍两个重要的数据结构：`rcu_ctrlblk` 和 `rcu_data`。`rcu_ctrlblk` 结构用于记录当前系统宽限期批次信息，而 `rcu_data` 结构用于记录每个CPU的调度次数与需要延迟执行的函数列表。
+
+#### rcu_ctrlblk 结构
+```cpp
+struct rcu_ctrlblk {
+    spinlock_t  mutex;
+    long        curbatch;
+    long        maxbatch;
+    cpumask_t   rcu_cpu_mask;
+};
+```
+rcu_ctrlblk 结构各个字段的作用：
+1. `mutex`：由于 `rcu_ctrlblk` 结构是全局变量，所需通过这个锁来进行同步。
+2. `curbatch`：当前批次数（`RCU` 的实现把每个宽限期当成是一个批次）。
+3. `maxbatch`：系统最大批次数，如果 `maxbatch` 大于 `curbatch` 说明还有没有完成的批次。
+4. `rcu_cpu_mask`：当前批次还没有进行调度的CPU列表，因为前面说过，必须所有CPU进行一次调度宽限期才能算结束。
+
+#### rcu_data 结构
+```cpp
+struct rcu_data {
+    long              qsctr;         /* User-mode/idle loop etc. */
+    long              last_qsctr;    /* value of qsctr at beginning */
+                                     /* of rcu grace period */
+    long              batch;         /* Batch # for current RCU batch */
+    struct list_head  nxtlist;
+    struct list_head  curlist;
+};
+```
+每个CPU都有一个 `rcu_data` 结构，其各个字段的作用如下：
+1. `qsctr`：当前CPU调度的次数。
+2. `last_qsctr`：用于记录宽限期开始时的调度次数，如果 `qsctr` 比它大，说明当前CPU的宽限期已经结束。
+3. `batch`：用于记录当前CPU的批次数。
+4. `nxtlist`：下一次批次要执行的函数列表。
+5. `curlist`：当前批次要执行的函数列表。
+
+#### 时钟中断
+
+每次时钟中断都会触发调用 `scheduler_tick()` 函数，而 `scheduler_tick()` 函数会调用 `rcu_check_callbacks()` 函数，调用链：`scheduler_tick() -> rcu_check_callbacks()`。`rcu_check_callbacks()` 函数实现如下：
+```cpp
+void rcu_check_callbacks(int cpu, int user)
+{
+    if (user || (idle_cpu(cpu) && !in_softirq() && hardirq_count() <= (1 << HARDIRQ_SHIFT))) {
+        RCU_qsctr(cpu)++;
+    }
+    tasklet_schedule(&RCU_tasklet(cpu)); // 这里会调用 rcu_process_callbacks() 函数
+}
+```
+这个函数主要做两件事情：
+1. 判断当前进程是否处于用户态，如果是就对当前CPU的 `rcu_data` 结构的 `qsctr` 字段进行加一操作。
+2. 调用 `rcu_process_callbacks()` 函数继续进行其他工作。
+
+我们解析来分析 `rcu_process_callbacks()` 函数：
+```cpp
+static void rcu_process_callbacks(unsigned long unused)
+{
+    int cpu = smp_processor_id();
+    LIST_HEAD(list);
+
+    if (!list_empty(&RCU_curlist(cpu)) &&
+        rcu_batch_after(rcu_ctrlblk.curbatch, RCU_batch(cpu))) {
+        list_splice(&RCU_curlist(cpu), &list);
+        INIT_LIST_HEAD(&RCU_curlist(cpu));
+    }
+
+    local_irq_disable();
+    if (!list_empty(&RCU_nxtlist(cpu)) && list_empty(&RCU_curlist(cpu))) {
+        list_splice(&RCU_nxtlist(cpu), &RCU_curlist(cpu));
+        INIT_LIST_HEAD(&RCU_nxtlist(cpu));
+        local_irq_enable();
+
+        /*
+         * start the next batch of callbacks
+         */
+        spin_lock(&rcu_ctrlblk.mutex);
+        RCU_batch(cpu) = rcu_ctrlblk.curbatch + 1;
+        rcu_start_batch(RCU_batch(cpu));
+        spin_unlock(&rcu_ctrlblk.mutex);
+    } else {
+        local_irq_enable();
+    }
+
+    rcu_check_quiescent_state();
+
+    if (!list_empty(&list))
+        rcu_do_batch(&list);
+}
+```
