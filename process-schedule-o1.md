@@ -6,11 +6,18 @@ Linux2.4版本使用的调度算法的时间复杂度为O(n)，其主要原理�
 
 而Linux2.6开始替换成名为 `O(1)调度算法`，顾名思义，其时间复杂度为O(1)。虽然在后面的版本开始使用 `CFS调度算法（完全公平调度算法）`，但了解 `O(1)调度算法` 对学习Linux调度器还是有很大帮助的，所以本文主要介绍 `O(1)调度算法` 的原理与实现。
 
+由于在 Linux 内核中，任务和进程是相同的概念，所以在本文混用了任务和进程这两个名词。
+
 ### O(1)调度算法原理
 
-`O(1)调度算法` 通过优先级来对任务进行分组，可分为140个优先级（0 ~ 139），每个优先级的任务由一个队列来维护。`prio_array` 结构就是用来维护这些任务队列，如下代码：
+#### `prio_array` 结构
+
+`O(1)调度算法` 通过优先级来对任务进行分组，可分为140个优先级（0 ~ 139，数值越小优先级越高），每个优先级的任务由一个队列来维护。`prio_array` 结构就是用来维护这些任务队列，如下代码：
 ```cpp
-#define MAX_PRIO (100 + 40)
+#define MAX_USER_RT_PRIO    100
+#define MAX_RT_PRIO         MAX_USER_RT_PRIO
+#define MAX_PRIO            (MAX_RT_PRIO + 40)
+
 #define BITMAP_SIZE ((((MAX_PRIO+1+7)/8)+sizeof(long)-1)/sizeof(long))
 
 struct prio_array {
@@ -28,7 +35,9 @@ struct prio_array {
 
 ![prio_array](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/process-schedule-o1.jpg)
 
-从上图可以看出，`bitmap` 的第2位和第6位为1（红色代表为1，白色代表为0），表示优先级为2和6的任务队列不为空，也就是说 `queue` 数组的第2个元素和第6个元素的队列不为空。
+如上图所述，`bitmap` 的第2位和第6位为1（红色代表为1，白色代表为0），表示优先级为2和6的任务队列不为空，也就是说 `queue` 数组的第2个元素和第6个元素的队列不为空。
+
+#### `runqueue` 结构
 
 另外，为了减少多核CPU之间的竞争，所以每个CPU都需要维护一份本地的优先队列。因为如果使用全局的优先队列，那么多核CPU就需要对全局优先队列进行上锁，从而导致性能下降。
 
@@ -59,3 +68,75 @@ struct runqueue {
 如下图所示：
 
 ![process-schedule-o1-move](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/process-schedule-o1-move.jpg)
+
+`O(1)调度算法` 把140个优先级的前100个（0 ~ 99）作为 `实时进程优先级`，而后40个（100 ~ 139）作为 `普通进程优先级`。实时进程被放置到实时进程优先级的队列中，而普通进程放置到普通进程优先级的队列中。
+
+#### 实时进程调度
+
+实时进程分为 `FIFO（先进先出）` 和 `RR（时间轮询）` 两种，其调度算法比较简单，如下：
+1. `先进先出的实时进程调度`：如果调度器在执行某个先进先出的实时进程，那么调度器会一直运行这个进程，直至其主动放弃运行权（退出进程或者sleep等）。
+2. `时间轮询的实时进程调度`：如果调度器在执行某个时间轮询的实时进程，那么调度器会判断当前进程的时间片是否用完，如果用完的话，那么重新分配时间片给它，并且重新放置回 `active` 队列中，然后调度到其他同优先级或者优先级更高的实时进程进行运行。
+
+#### 普通进程调度
+
+每个进程都要一个动态优先级和静态优先级，静态优先级不会变化（进程创建是被设置），而动态优先级会随着进程的睡眠时间而发生变化。动态优先级可以通过以下公式进行计算：
+```
+动态优先级 = max(100, min(静态优先级 – bonus + 5), 139))
+```
+上面公式的 `bonus（奖励或惩罚）` 是通过进程的睡眠时间计算出来，进程的睡眠时间越大，`bonus` 的值就越大，那么动态优先级就越高（前面说过优先级的值越小，优先级越高）。
+
+> 另外要说明一下，实时进程的动态优先级与静态优先级相同。
+
+当一个普通进程被添加到运行队列时，会先计算其动态优先级，然后按照动态优先级的值来添加到对应优先级的队列中。而调度器调度进程时，会先选择优先级最高的任务队列中的进程进行调度运行。
+
+#### 运行时间片计算
+
+当进程的时间用完后，就需要重新进行计算。进程的运行时间片与静态优先级有关，可以通过以下公式进行计算：
+```
+静态优先级 < 120，运行时间片 = max((140-静态优先级)*20, MIN_TIMESLICE)
+静态优先级 >= 120，运行时间片 = max((140-静态优先级)*5, MIN_TIMESLICE)
+```
+### O(1)调度算法实现
+
+接下来我们分析一下 `O(1)调度算法` 在内核中的实现。
+
+#### 时钟中断
+
+时钟中断是由硬件触发的，可以通过编程来设置其频率，Linux内核一般设置为每秒产生100 ~ 1000次。时钟中断会触发调用 `scheduler_tick()` 内核函数，其主要工作是：减少进程的可运行时间片，如果时间片用完，那么把进程从 `active` 队列移动到 `expired` 队列中。代码如下：
+```cpp
+void scheduler_tick(int user_ticks, int sys_ticks)
+{
+    runqueue_t *rq = this_rq();
+    task_t *p = current;
+
+    ...
+
+    // 处理普通进程
+    if (!--p->time_slice) {                // 减少时间片, 如果时间片用完
+        dequeue_task(p, rq->active);       // 把进程从运行队列中删除
+        set_tsk_need_resched(p);           // 设置要重新调度标志
+        p->prio = effective_prio(p);       // 重新计算动态优先级
+        p->time_slice = task_timeslice(p); // 重新计算时间片
+        p->first_time_slice = 0;
+
+        if (!rq->expired_timestamp)
+            rq->expired_timestamp = jiffies;
+
+        // 如果不是交互进程或者没有出来饥饿状态
+        if (!TASK_INTERACTIVE(p) || EXPIRED_STARVING(rq)) {
+            enqueue_task(p, rq->expired); // 移动到expired队列
+        } else
+            enqueue_task(p, rq->active);  // 重新放置到active队列
+    }
+    ...
+}
+```
+上面代码主要完成以下几个工作：
+1. 减少进程的时间片，并且判断时间片是否已经使用完。
+2. 如果时间片使用完，那么把进程从 `active` 队列中删除。
+3. 调用 `set_tsk_need_resched()` 函数设 `TIF_NEED_RESCHED` 标志，表示当前进程需要重新调度。
+4. 调用 `effective_prio()` 函数重新计算进程的动态优先级。
+5. 调用 `task_timeslice()` 函数重新计算进程的可运行时间片。
+6. 如果当前进程是交互进程或者出来饥饿状态，那么重新加入到 `active` 队列。
+7. 否则把今天移动到 `expired` 队列。
+
