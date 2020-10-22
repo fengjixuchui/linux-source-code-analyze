@@ -9,12 +9,13 @@
     * [并发同步](https://github.com/liexusong/linux-source-code-analyze/blob/master/concurrency-synchronize.md)
     * [等待队列](https://github.com/liexusong/linux-source-code-analyze/blob/master/waitqueue.md)
 * 内存管理
-    * [物理内存管理(上)](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-1.md)
-    * [物理内存管理(中)](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-2.md)
-    * [物理内存管理(下)](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-3.md)
+    * [物理内存管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-1.md)
+    * [伙伴分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-2.md)
+    * [Slab分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-3.md)
     * [虚拟内存管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/virtual_memory_address_manager.md)
     * [mmap完全剖析](https://github.com/liexusong/linux-source-code-analyze/blob/master/memory_mmap.md)
     * [内存交换](https://github.com/liexusong/linux-source-code-analyze/blob/master/memory_swap.md)
+    * [vmalloc原理与实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/vmalloc-memory-implements.md)
 * 中断机制
     * [硬件相关](https://github.com/liexusong/linux-source-code-analyze/blob/master/interrupt_hardware.md)
     * [中断处理](https://github.com/liexusong/linux-source-code-analyze/blob/master/interrupt_softward.md)
