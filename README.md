@@ -9,9 +9,9 @@
     * [并发同步](https://github.com/liexusong/linux-source-code-analyze/blob/master/concurrency-synchronize.md)
     * [等待队列](https://github.com/liexusong/linux-source-code-analyze/blob/master/waitqueue.md)
 * 内存管理
-    * [物理内存管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-1.md)
-    * [伙伴分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-2.md)
-    * [Slab分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen-3.md)
+    * [物理内存管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-managemen.md)
+    * [伙伴分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-buddy-system.md)
+    * [Slab分配算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/physical-memory-slab-algorithm.md)
     * [虚拟内存管理](https://github.com/liexusong/linux-source-code-analyze/blob/master/virtual_memory_address_manager.md)
     * [mmap完全剖析](https://github.com/liexusong/linux-source-code-analyze/blob/master/memory_mmap.md)
     * [内存交换](https://github.com/liexusong/linux-source-code-analyze/blob/master/memory_swap.md)
@@ -19,11 +19,12 @@
 * 中断机制
     * [硬件相关](https://github.com/liexusong/linux-source-code-analyze/blob/master/interrupt_hardware.md)
     * [中断处理](https://github.com/liexusong/linux-source-code-analyze/blob/master/interrupt_softward.md)
-* 系统调用
     * [系统调用](https://github.com/liexusong/linux-source-code-analyze/blob/master/syscall.md)
 * 文件系统
     * [虚拟文件系统](https://github.com/liexusong/linux-source-code-analyze/blob/master/virtual_file_system.md)
     * [MINIX文件系统](https://github.com/liexusong/linux-source-code-analyze/blob/master/minix_file_system.md)
+    * [通用块层](https://github.com/liexusong/linux-source-code-analyze/blob/master/filesystem-generic-block-layer.md)
+    * [直接I/O](https://github.com/liexusong/linux-source-code-analyze/blob/master/direct-io.md)
 * 进程间通信
     * [信号处理机制](https://github.com/liexusong/linux-source-code-analyze/blob/master/signal.md)
     * [共享内存](https://github.com/liexusong/linux-source-code-analyze/blob/master/ipc-shm.md)
@@ -43,3 +44,25 @@
     * [Epoll原理与实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/epoll-principle.md)
     * [RCU原理与实现](https://github.com/liexusong/linux-source-code-analyze/blob/master/rcu.md)
     * [O(1)调度算法](https://github.com/liexusong/linux-source-code-analyze/blob/master/process-schedule-o1.md)
+
+------------------------------------------------------------------------------------------------------------------
+```c
+#include <stdio.h>
+
+typedef struct {
+   char *Email;
+   char *WeChat;
+} Information;
+
+
+int main(int argc, char *argv[])
+{
+    Information info;
+    
+    info.Email = "liexusong@qq.com";
+    info.WeChat = "JaydenSongLie";
+    
+    printf("You can contact me by Email: %s and WeChat: %s", info.Email, info.WeChat);
+}
+```
+------------------------------------------------------------------------------------------------------------------
