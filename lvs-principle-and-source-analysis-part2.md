@@ -359,4 +359,316 @@ ip_vs_rr_schedule(struct ip_vs_service *svc, struct iphdr *iph)
 
 如上图所示，刚开始时调度器选择了 `Real-Server(1)` 服务器进行处理客户端请求，但第二次调度时却选择了 `Real-Server(2)` 来处理客户端请求。
 
-由于 `TCP协议` 需要客户端与服务器进行连接，但第二次请求的服务器发生了变化，所以连接状态就失效了，这就为什么 LVS 需要维持客户端与真实服务器连接关系的原因。
+由于 `TCP协议` 需要客户端与服务器进行连接，但第二次请求的服务器发生了变化，所以连接状态就失效了，这就为什么 `LVS` 需要维持客户端与真实服务器连接关系的原因。
+
+`LVS` 通过 `ip_vs_conn` 对象来维护客户端与真实服务器之间的连接关系，其定义如下：
+
+```c
+struct ip_vs_conn {
+    struct list_head    c_list;     /* 用于连接到哈希表 */
+
+    __u32               caddr;      /* 客户端IP地址 */
+    __u32               vaddr;      /* 虚拟IP地址 */
+    __u32               daddr;      /* 真实服务器IP地址 */
+    __u16               cport;      /* 客户端端口 */
+    __u16               vport;      /* 虚拟端口 */
+    __u16               dport;      /* 真实服务器端口 */
+    __u16               protocol;   /* 协议类型（UPD/TCP） */
+    ...
+    /* 用于发送数据包的接口 */
+    int (*packet_xmit)(struct sk_buff *skb, struct ip_vs_conn *cp);
+    ...
+};
+```
+
+`ip_vs_conn` 对象各个字段的作用都在注释中进行说明了，客户端与真实服务器的连接关系就是通过 `协议类型`、`客户端IP`、`客户端端口`、`虚拟IP` 和 `虚拟端口` 来进行关联的，也就是说根据这五元组能够确定一个 `ip_vs_conn` 对象。
+
+另外，在《[原理篇](https://github.com/liexusong/linux-source-code-analyze/blob/master/lvs-principle-and-source-analysis-part1.md)》我们说过，LVS 有3中运行模式：`NAT模式`、`DR模式` 和 `TUN模式`。而对于不同的运行模式，发送数据包的接口是不一样的，所以 `ip_vs_conn` 对象的 `packet_xmit` 字段会根据不同的运行模式来选择不同的发送数据包接口，绑定发送数据包接口是通过 `ip_vs_bind_xmit()` 函数完成，如下：
+
+```c
+static inline void ip_vs_bind_xmit(struct ip_vs_conn *cp)
+{
+    switch (IP_VS_FWD_METHOD(cp)) {
+    case IP_VS_CONN_F_MASQ:                     // NAT模式
+        cp->packet_xmit = ip_vs_nat_xmit;
+        break;
+    case IP_VS_CONN_F_TUNNEL:                   // TUN模式
+        cp->packet_xmit = ip_vs_tunnel_xmit;
+        break;
+    case IP_VS_CONN_F_DROUTE:                   // DR模式
+        cp->packet_xmit = ip_vs_dr_xmit;
+        break;
+    ...
+    }
+}
+```
+
+一个客户端请求到达 `LVS` 后，`Director服务器` 首先会查找客户端是否已经与真实服务器建立了连接关系，如果已经建立了连接，那么直接使用这个连接关系。否则，通过调度器对象选择一台合适的真实服务器，然后创建客户端与真实服务器的连接关系，并且保存到全局哈希表 `ip_vs_conn_tab` 中。流程图如下：
+
+![lvs-connection-process](https://raw.githubusercontent.com/liexusong/linux-source-code-analyze/master/images/lvs-connection-process.png)
+
+上面对 `LVS` 各个角色都进行了介绍，下面开始讲解 `LVS` 对数据包的转发过程。
+
+### 3. 数据转发
+
+因为 `LVS` 是一个负载均衡工具，所以其最重要的功能就是对数据的调度与转发， 而对数据的转发是在前面介绍的 `Netfilter` 钩子函数进行的。
+
+对数据的转发主要是通过 `ip_vs_in()` 和 `ip_vs_out()` 这两个钩子函数：
+
+*   `ip_vs_in()` 运行在 `Netfilter` 的 `LOCAL_IN` 阶段。
+
+*   `ip_vs_out()` 运行在 `Netfilter` 的 `FORWARD` 阶段。
+
+`FORWARD` 阶段发送在数据包不是发送给本机的情况，但是一般来说数据包都是发送给本机的，所以对于 `ip_vs_out()` 这个函数的实现就不作介绍，我们主要重点分析 `ip_vs_in()` 这个函数。
+
+#### ip_vs_in() 钩子函数
+
+有了前面的知识点，我们对 `ip_vs_in()` 函数的分析就不那么困难了。下面我们分段对 `ip_vs_in()` 函数进行分析：
+
+```c
+static unsigned int
+ip_vs_in(unsigned int hooknum,
+         struct sk_buff **skb_p,
+         const struct net_device *in,
+         const struct net_device *out,
+         int (*okfn)(struct sk_buff *))
+{
+    struct sk_buff *skb = *skb_p;
+    struct iphdr *iph = skb->nh.iph; // IP头部
+    union ip_vs_tphdr h;
+    struct ip_vs_conn *cp;
+    struct ip_vs_service *svc;
+    int ihl;
+    int ret;
+    ...
+    // 因为LVS只支持TCP和UDP
+    if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+        return NF_ACCEPT;
+
+    ihl = iph->ihl << 2; // IP头部长度
+
+    // IP头部是否正确
+    if (ip_vs_header_check(skb, iph->protocol, ihl) == -1)
+        return NF_DROP;
+
+    iph = skb->nh.iph;         // IP头部指针
+    h.raw = (char*)iph + ihl;  // TCP/UDP头部指针
+```
+
+上面的代码主要对数据包的 `IP头部` 进行正确性验证，并且将 `iph` 变量指向 `IP头部`，而 `h` 变量指向 `TCP/UDP` 头部。
+
+```c
+    // 根据 "协议类型", "客户端IP", "客户端端口", "虚拟IP", "虚拟端口" 五元组获取连接对象
+    cp = ip_vs_conn_in_get(iph->protocol, iph->saddr,
+                           h.portp[0], iph->daddr, h.portp[1]);
+
+    // 1. 如果连接还没建立
+    // 2. 如果是TCP协议的话, 第一个包必须是syn包, 或者UDP协议。
+    // 3. 根据协议、虚拟IP和虚拟端口查找服务对象
+    if (!cp && 
+        (h.th->syn || (iph->protocol != IPPROTO_TCP)) &&
+        (svc = ip_vs_service_get(skb->nfmark, iph->protocol, iph->daddr, h.portp[1])))
+    {
+        ...
+        // 通过调度器选择一个真实服务器
+        // 并且创建一个新的连接对象, 建立真实服务器与客户端连接关系
+        cp = ip_vs_schedule(svc, iph); 
+        ...
+    }
+```
+
+上面的代码主要完成以下几个功能：
+
+*   根据 `协议类型`、`客户端IP`、`客户端端口`、`虚拟IP` 和 `虚拟端口` 五元组，然后调用 `ip_vs_conn_in_get()` 函数获取连接对象。
+
+*   如果连接还没建立，那么就调用 `ip_vs_schedule()` 函数调度一台合适的真实服务器，然后创建一个连接对象，并且建立真实服务器与客户端之间的连接关系。
+
+我们来分析一下 `ip_vs_schedule()` 函数的实现：
+
+```c
+static struct ip_vs_conn *
+ip_vs_schedule(struct ip_vs_service *svc, struct iphdr *iph)
+{
+    struct ip_vs_conn *cp = NULL;
+    struct ip_vs_dest *dest;
+    const __u16 *portp;
+    ...
+    portp = (__u16 *)&(((char *)iph)[iph->ihl*4]); // 指向TCP或者UDP头部
+    ...
+    dest = svc->scheduler->schedule(svc, iph); // 通过调度器选择一台合适的真实服务器
+    ...
+    cp = ip_vs_conn_new(iph->protocol,                      // 协议类型
+                        iph->saddr,                         // 客户端IP
+                        portp[0],                           // 客户端端口
+                        iph->daddr,                         // 虚拟IP
+                        portp[1],                           // 虚拟端口
+                        dest->addr,                         // 真实服务器的IP
+                        dest->port ? dest->port : portp[1], // 真实服务器的端口
+                        0,                                  // flags
+                        dest);
+    ...
+    return cp;
+}
+```
+
+`ip_vs_schedule()` 函数的主要工作如下：
+
+*   首先通过调用调度器（`ip_vs_scheduler` 对象）的 `schedule()` 方法从 `ip_vs_service` 对象的 `destinations` 链表中选择一台真实服务器（`ip_vs_dest` 对象）
+
+*   然后调用 `ip_vs_conn_new()` 函数创建一个新的 `ip_vs_conn` 对象。
+
+`ip_vs_conn_new()` 主要用于创建 `ip_vs_conn` 对象，并且根据 `LVS` 的运行模式为其选择正确的数据发送接口，其实现如下：
+
+```c
+struct ip_vs_conn *
+ip_vs_conn_new(int proto,                   // 协议类型
+               __u32 caddr, __u16 cport,    // 客户端IP和端口
+               __u32 vaddr, __u16 vport,    // 虚拟IP和端口
+               __u32 daddr, __u16 dport,    // 真实服务器IP和端口
+               unsigned flags, struct ip_vs_dest *dest)
+{
+    struct ip_vs_conn *cp;
+
+    // 创建一个 ip_vs_conn 对象
+    cp = kmem_cache_alloc(ip_vs_conn_cachep, GFP_ATOMIC); 
+    ...
+    // 设置 ip_vs_conn 对象的各个字段
+    cp->protocol = proto;
+    cp->caddr = caddr;
+    cp->cport = cport;
+    cp->vaddr = vaddr;
+    cp->vport = vport;
+    cp->daddr = daddr;
+    cp->dport = dport;
+    cp->flags = flags;
+    ...
+    ip_vs_bind_dest(cp, dest); // 将 ip_vs_conn 与真实服务器对象进行绑定
+    ...
+    ip_vs_bind_xmit(cp); // 绑定一个发送数据的接口
+    ...
+    ip_vs_conn_hash(cp); // 把 ip_vs_conn 对象添加到连接信息表中
+
+    return cp;
+}
+```
+
+`ip_vs_conn_new()` 函数的主要工作如下：
+
+*   创建一个新的 `ip_vs_conn` 对象，并且设置其各个字段的值。
+
+*   调用 `ip_vs_bind_dest()` 函数将 `ip_vs_conn` 对象与真实服务器对象（`ip_vs_dest` 对象）进行绑定。
+
+*   根据 `LVS` 的运行模式，调用 `ip_vs_bind_xmit()` 函数为连接对象选择一个正确的数据发送接口，`ip_vs_bind_xmit()` 函数在前面已经介绍过。
+
+*   调用 `ip_vs_conn_hash()` 函数把新创建的 `ip_vs_conn` 对象添加到全局连接信息哈希表中。
+
+我们接着分析 `ip_vs_in()` 函数：
+
+```c
+    if (cp->packet_xmit)
+        ret = cp->packet_xmit(skb, cp); // 把数据包转发出去
+    else {
+        ret = NF_ACCEPT;
+    }
+    ...
+    return ret;
+}
+```
+
+`ip_vs_in()` 函数的最后部分就是通过调用数据发送接口把数据包转发出去，对于 `NAT模式` 来说，数据发送接口就是 `ip_vs_nat_xmit()`。
+
+接下来，我们对 `NAT模式` 的数据发送接口 `ip_vs_nat_xmit()` 进行分析。由于 `ip_vs_nat_xmit()` 函数的实现比较复杂，所以我们通过分段来分析：
+
+```c
+static int ip_vs_nat_xmit(struct sk_buff *skb, struct ip_vs_conn *cp)
+{
+    struct rtable *rt;      /* Route to the other host */
+    struct iphdr  *iph;
+    union ip_vs_tphdr h;
+    int ihl;
+    unsigned short size;
+    int mtu;
+    ...
+    iph = skb->nh.iph;                // IP头部
+    ihl = iph->ihl << 2;              // IP头部长度
+    h.raw = (char*) iph + ihl;        // 传输层头部(TCP/UDP)
+    size = ntohs(iph->tot_len) - ihl; // 数据长度
+    ...
+    // 找到真实服务器IP的路由信息
+    if (!(rt = __ip_vs_get_out_rt(cp, RT_TOS(iph->tos)))) 
+        goto tx_error_icmp;
+    ...
+    // 替换新路由信息
+    dst_release(skb->dst);
+    skb->dst = &rt->u.dst;
+```
+
+上面的代码主要完成两个工作：
+
+*   调用 `__ip_vs_get_out_rt()` 函数查找真实服务器 IP 对应的路由信息对象。
+
+*   把数据包的旧路由信息替换成新的路由信息。
+
+我们接着分析：
+
+```c
+    iph->daddr = cp->daddr; // 修改目标IP地址为真实服务器IP地址
+    h.portp[1] = cp->dport; // 修改目标端口为真实服务器端口
+    ...
+    // 更新UDP/TCP头部的校验和
+    if (!cp->app && (iph->protocol != IPPROTO_UDP || h.uh->check != 0)) {
+        ip_vs_fast_check_update(&h, cp->vaddr, cp->daddr, cp->vport,
+                                cp->dport, iph->protocol);
+
+        if (skb->ip_summed == CHECKSUM_HW)
+            skb->ip_summed = CHECKSUM_NONE;
+
+    } else {
+        switch (iph->protocol) {
+        case IPPROTO_TCP:
+            h.th->check = 0;
+            h.th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+                                            size, iph->protocol,
+                                            csum_partial(h.raw, size, 0));
+            break;
+
+        case IPPROTO_UDP:
+            h.uh->check = 0;
+            h.uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+                                            size, iph->protocol,
+                                            csum_partial(h.raw, size, 0));
+            if (h.uh->check == 0)
+                h.uh->check = 0xFFFF;
+            break;
+        }
+
+        skb->ip_summed = CHECKSUM_UNNECESSARY;
+    }
+```
+
+上面的代码完成两个工作：
+
+*   修改目标IP地址和端口为真实服务器IP地址和端口。
+
+*   更新 `UDP/TCP 头部` 的校验和（checksum）。
+
+我们接着分析：
+
+```c
+    ip_send_check(iph); // 计算IP头部的校验和
+    ...
+    skb->nfcache |= NFC_IPVS_PROPERTY;
+
+    ip_send(skb); // 把包发送出去
+    ...
+
+    return NF_STOLEN; // 让其他 Netfilter 的钩子函数放弃处理该包
+}
+```
+
+上面的代码完成两个工作：
+
+*   调用 `ip_send_check()` 函数重新计算数据包的 `IP头部` 校验和。
+
+*   调用 `ip_send()` 函数把数据包发送出去。
+
